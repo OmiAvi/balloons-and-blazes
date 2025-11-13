@@ -1,52 +1,63 @@
+// ------------------------------------------------------------
+//  FAST, CACHED, PARALLELIZED SERVER FOR BALLOONS & BLAZES
+// ------------------------------------------------------------
+
 import dotenv from "dotenv";
-dotenv.config();
 import express from "express";
+import fetch from "node-fetch";
+import path from "path";
+import { fileURLToPath } from "url";
+
+dotenv.config();
+
+// ESM-safe __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
 const PORT = process.env.PORT || 4000;
+
+// Serve Vite build (client/dist)
+const distPath = path.join(__dirname, "..", "client", "dist");
+app.use(express.static(distPath));
+
 console.log("FIRMS_KEY loaded?", !!process.env.FIRMS_KEY);
-// Helper to pad hour numbers, 0 -> "00", 3 -> "03"
+
+// ------------------------------------------------------------
+//  HELPERS
+// ------------------------------------------------------------
+
 const padHour = (h) => h.toString().padStart(2, "0");
 
-// Fetch one hour snapshot: 00.json, 01.json, ... 23.json
+// Fetch a single hour snapshot
 async function fetchHourSnapshot(hour) {
   const url = `https://a.windbornesystems.com/treasure/${padHour(hour)}.json`;
 
   try {
-    const res = await fetch(url, { timeout: 10_000 });
-    if (!res.ok) {
-      console.warn("Non-200 from treasure API", url, res.status);
-      return null;
-    }
-    const data = await res.json();
-    return data;
-  } catch (err) {
-    console.error("Error fetching", url, err.message);
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
     return null;
   }
 }
 
-// YOUR FORMAT: [lat, lon, altitude]
-// We'll treat `balloonId` as the index in the array for that hour.
-function normalizePoint(raw, snapshotTime, balloonIndex) {
-  // Case 1: it's an array like [lat, lon, alt]
+function normalizePoint(raw, timestamp, index) {
   if (Array.isArray(raw)) {
-    if (raw.length < 2) return null;
     const [lat, lon, altitude] = raw;
-
     if (typeof lat !== "number" || typeof lon !== "number") return null;
 
     return {
-      id: `balloon-${balloonIndex}`,
+      id: `balloon-${index}`,
       lat,
       lon,
       altitude: typeof altitude === "number" ? altitude : null,
-      timestamp: snapshotTime,
+      timestamp,
     };
   }
 
-  // Case 2: if they ever change the format to an object, handle that too
   try {
-    const id = raw.id ?? `balloon-${balloonIndex}`;
+    const id = raw.id ?? `balloon-${index}`;
     const lat = raw.lat ?? raw.latitude;
     const lon = raw.lon ?? raw.longitude;
     const altitude = raw.alt ?? raw.altitude ?? null;
@@ -58,79 +69,62 @@ function normalizePoint(raw, snapshotTime, balloonIndex) {
       lat,
       lon,
       altitude: typeof altitude === "number" ? altitude : null,
-      timestamp: snapshotTime,
+      timestamp,
     };
   } catch {
     return null;
   }
 }
 
-// Build 24h flight histories by stitching together each hour's array of balloons
+// Downsample long tracks to reduce payload & speed up calcs
+function downsample(arr, every = 3) {
+  if (arr.length <= 3) return arr;
+  return arr.filter((_, i) => i % every === 0);
+}
+
+// Build all balloon flights (PARALLEL fetch)
 async function loadBalloonFlights() {
-  const historiesById = new Map();
-  const now = new Date();
+  console.log("loadBalloonFlights: start");
 
-  for (let hour = 0; hour < 24; hour++) {
-    const snapshot = await fetchHourSnapshot(hour);
-    if (!snapshot || !Array.isArray(snapshot)) {
-      console.warn("Snapshot missing or not an array for hour", hour);
-      continue;
-    }
+  // 1. Fetch 24 snapshots IN PARALLEL
+  const hours = [...Array(24).keys()];
+  const snapshots = await Promise.all(hours.map(fetchHourSnapshot));
 
-    // We'll treat this as "now - hour"
-    const snapshotTime = new Date(
-      now.getTime() - hour * 3600_000
-    ).toISOString();
+  const now = Date.now();
+  const histories = new Map();
 
-    // snapshot is like:
-    // [
-    //   [lat, lon, alt],   // balloon index 0
-    //   [lat, lon, alt],   // balloon index 1
-    //   ...
-    // ]
-    snapshot.forEach((rawEntry, index) => {
-      const pt = normalizePoint(rawEntry, snapshotTime, index);
+  // 2. Normalize and merge data
+  snapshots.forEach((snapshot, hour) => {
+    if (!snapshot || !Array.isArray(snapshot)) return;
+
+    const timestamp = new Date(now - hour * 3600_000).toISOString();
+
+    snapshot.forEach((raw, index) => {
+      const pt = normalizePoint(raw, timestamp, index);
       if (!pt) return;
 
-      if (!historiesById.has(pt.id)) historiesById.set(pt.id, []);
-      historiesById.get(pt.id).push(pt);
+      if (!histories.has(pt.id)) histories.set(pt.id, []);
+      histories.get(pt.id).push(pt);
     });
-  }
+  });
 
-  // Turn map into an array and sort the tracks by timestamp
+  // 3. Sort and downsample tracks
   const flights = [];
-  for (const [id, points] of historiesById.entries()) {
-    // Sort oldest -> newest
-    points.sort(
-      (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
-    );
+  for (const [id, points] of histories) {
+    points.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 
     flights.push({
       id,
       latest: points[points.length - 1],
-      track: points,
+      track: downsample(points, 3),
     });
   }
 
+  console.log("loadBalloonFlights: done, flights:", flights.length);
   return flights;
 }
 
-// Debug endpoint to check that everything works
-app.get("/api/balloons", async (_req, res) => {
-  try {
-    const flights = await loadBalloonFlights();
-    res.json({ flights });
-  } catch (err) {
-    console.error("Error in /api/balloons", err.message);
-    res.status(500).json({ error: "Failed to load balloons" });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`Server listening on http://localhost:${PORT}`);
-});
-
-// Compute a simple bounding box around all balloon points
+// Compute bounding box around balloon tracks
 function computeBounds(flights) {
   let minLat = 90,
     maxLat = -90,
@@ -139,74 +133,41 @@ function computeBounds(flights) {
 
   for (const f of flights) {
     for (const p of f.track) {
-      if (p.lat < minLat) minLat = p.lat;
-      if (p.lat > maxLat) maxLat = p.lat;
-      if (p.lon < minLon) minLon = p.lon;
-      if (p.lon > maxLon) maxLon = p.lon;
+      minLat = Math.min(minLat, p.lat);
+      maxLat = Math.max(maxLat, p.lat);
+      minLon = Math.min(minLon, p.lon);
+      maxLon = Math.max(maxLon, p.lon);
     }
   }
 
-  const margin = 5;
-
-  // apply margin
-  minLat -= margin;
-  maxLat += margin;
-  minLon -= margin;
-  maxLon += margin;
-
-  // clamp to valid lat/lon ranges
-  minLat = Math.max(minLat, -89.9);
-  maxLat = Math.min(maxLat, 89.9);
-  minLon = Math.max(minLon, -179.9);
-  maxLon = Math.min(maxLon, 179.9);
+  const margin = 1; // MUCH smaller region → fewer fires
+  minLat = Math.max(minLat - margin, -89);
+  maxLat = Math.min(maxLat + margin, 89);
+  minLon = Math.max(minLon - margin, -179);
+  maxLon = Math.min(maxLon + margin, 179);
 
   return { minLat, maxLat, minLon, maxLon };
 }
 
-
-
-function haversineKm(lat1, lon1, lat2, lon2) {
-  const R = 6371; // km
-  const toRad = (d) => (d * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) ** 2;
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
-
-async function fetchFiresForBounds(bounds) {
+// Fetch FIRMS fires (LIMIT output)
+async function fetchFires(bounds) {
   const key = process.env.FIRMS_KEY;
   const product = process.env.FIRMS_PRODUCT || "VIIRS_SNPP_NRT";
 
   if (!key) {
-    console.warn("No FIRMS_KEY set; returning empty fires array");
+    console.warn("No FIRMS_KEY - returning empty fires.");
     return [];
   }
 
-  // Bounds already clamped in computeBounds
   const { minLat, minLon, maxLat, maxLon } = bounds;
 
-  // FIRMS expects: west,south,east,north
-  const areaCoords = `${minLon},${minLat},${maxLon},${maxLat}`;
-
-  // Last 2 days of data (1..10 allowed)
-  const dayRange = 2;
-
-  const url = `https://firms.modaps.eosdis.nasa.gov/api/area/csv/${key}/${product}/${areaCoords}/${dayRange}`;
+  const url = `https://firms.modaps.eosdis.nasa.gov/api/area/csv/${key}/${product}/${minLon},${minLat},${maxLon},${maxLat}/2`;
 
   console.log("FIRMS URL:", url);
 
   try {
     const res = await fetch(url);
-    if (!res.ok) {
-      console.warn("FIRMS non-200", res.status);
-      return [];
-    }
+    if (!res.ok) return [];
 
     const text = await res.text();
     const lines = text.trim().split(/\r?\n/);
@@ -216,9 +177,7 @@ async function fetchFiresForBounds(bounds) {
     const fires = lines.slice(1).map((line) => {
       const cols = line.split(",");
       const obj = {};
-      headers.forEach((h, idx) => {
-        obj[h] = cols[idx];
-      });
+      headers.forEach((h, i) => (obj[h] = cols[i]));
 
       const lat = parseFloat(obj.latitude);
       const lon = parseFloat(obj.longitude);
@@ -235,25 +194,39 @@ async function fetchFiresForBounds(bounds) {
       };
     });
 
-    return fires.filter(Boolean);
-  } catch (err) {
-    console.error("Error fetching FIRMS fires", err.message);
+    // Keep only closest 300 to avoid huge payloads
+    return fires.filter(Boolean).slice(0, 300);
+  } catch (e) {
+    console.error("FIRMS fetch error", e);
     return [];
   }
 }
 
-function summarizeFlightsWithFires(flights, fires) {
+// Simple Haversine
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function summarizeFlights(flights, fires) {
   return flights.map((f) => {
     let minDist = Infinity;
-    let closestFire = null;
+    let closest = null;
 
-    for (const p of f.track) {
-      for (const fire of fires) {
-        const d = haversineKm(p.lat, p.lon, fire.lat, fire.lon);
-        if (d < minDist) {
-          minDist = d;
-          closestFire = fire;
-        }
+    // Only compare f.latest to fires → MUCH faster
+    for (const fire of fires) {
+      const d = haversineKm(f.latest.lat, f.latest.lon, fire.lat, fire.lon);
+      if (d < minDist) {
+        minDist = d;
+        closest = fire;
       }
     }
 
@@ -261,35 +234,67 @@ function summarizeFlightsWithFires(flights, fires) {
       ...f,
       fire_summary: {
         min_distance_km: isFinite(minDist) ? minDist : null,
-        closest_fire: closestFire,
+        closest_fire: closest,
       },
     };
   });
 }
-app.get("/api/scene", async (_req, res) => {
+
+// ------------------------------------------------------------
+//  BUILD SCENE WITH 5-MIN CACHE
+// ------------------------------------------------------------
+
+let cachedScene = null;
+let lastSceneTime = 0;
+
+async function buildScene() {
+  const flights = await loadBalloonFlights();
+  if (!flights.length) return { flights: [], fires: [], bounds: null };
+
+  const bounds = computeBounds(flights);
+  const fires = await fetchFires(bounds);
+  const flightsWithFires = summarizeFlights(flights, fires);
+
+  return {
+    flights: flightsWithFires,
+    fires,
+    bounds,
+    generated_at: new Date().toISOString(),
+  };
+}
+
+// ------------------------------------------------------------
+//  API ROUTES
+// ------------------------------------------------------------
+
+app.get("/api/scene", async (req, res) => {
   try {
-    const flights = await loadBalloonFlights();
-    if (!flights.length) {
-      return res.json({
-        flights: [],
-        fires: [],
-        bounds: null,
-        generated_at: new Date().toISOString(),
-      });
+    const now = Date.now();
+
+    if (cachedScene && now - lastSceneTime < 5 * 60 * 1000) {
+      return res.json(cachedScene);
     }
 
-    const bounds = computeBounds(flights);
-    const fires = await fetchFiresForBounds(bounds);
-    const flightsWithFires = summarizeFlightsWithFires(flights, fires);
+    const scene = await buildScene();
+    cachedScene = scene;
+    lastSceneTime = now;
 
-    res.json({
-      flights: flightsWithFires,
-      fires,
-      bounds,
-      generated_at: new Date().toISOString(),
-    });
+    res.json(scene);
   } catch (err) {
-    console.error("Scene error", err.message);
+    console.error("Scene error", err);
     res.status(500).json({ error: "Failed to build scene" });
   }
+});
+
+// ------------------------------------------------------------
+//  SPA FALLBACK (MUST BE LAST)
+// ------------------------------------------------------------
+app.get("*", (req, res) => {
+  res.sendFile(path.join(distPath, "index.html"));
+});
+
+// ------------------------------------------------------------
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running at http://0.0.0.0:${PORT}`);
 });
