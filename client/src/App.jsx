@@ -144,7 +144,7 @@ function App() {
             letterSpacing: "0.5px",
           }}
         >
-          Balloons &amp; Blazes (24h)
+          Balloons &amp; Blazes
         </h1>
         <p
           style={{
@@ -154,8 +154,7 @@ function App() {
             marginBottom: "1.5rem",
           }}
         >
-          Live WindBorne balloon tracks for the last 24 hours, combined with NASA FIRMS wildfire hotspots to show how
-          close balloons get to active fires.
+          By combining real-time balloon flight paths with active wildfire hotspots, this tool highlights when balloons drift near dangerous fire zones, shows how wildfire heat and winds affect balloon movement, helps validate atmospheric models during extreme events, and supports early detection, risk assessment, and better planning for wildfire-impacted regions.
         </p>
 
         <div
